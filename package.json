@@ -8,7 +8,7 @@
     "build": "block-basekit-cli build:field",
     "pack": "block-basekit-cli pack:field",
     "dev": "block-basekit-cli dev:field",
-    "test": "node --require ts-node/register/transpile-only tests/normalize-error.test.ts"
+    "test": "TS_NODE_TRANSPILE_ONLY=1 node --require ts-node/register tests/normalize-error.test.ts"
   },
   "author": "",
   "license": "ISC",
