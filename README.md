@@ -1,7 +1,71 @@
-# Getting Started
-- Run `npm install` to install dependencies
-- Run `npm start` to start server
-- Run `npm run dev` to test execute function
+# 【FBIF】网页转Markdown
 
-# Publish
-Run `npm run pack` to create output/output.zip file
+将网页链接转换为 Markdown 格式的飞书多维表格字段捷径。
+
+## 功能特点
+
+- **微信公众号文章**：使用专用解析器，精准提取标题和正文
+- **普通网页**：使用 Jina Reader API 智能提取内容
+- **图片处理**：自动通过代理服务解决微信图片防盗链问题
+- **多语言支持**：中文、英文、日文界面
+
+## 支持的字段类型
+
+- 文本字段
+- 超链接字段
+
+## 使用方法
+
+1. 在多维表格中添加【FBIF】网页转Markdown 捷径字段
+2. 选择包含网页链接的字段
+3. 可选填写 Jina API Key（提高请求限额）
+4. 保存后自动提取网页内容
+
+开发与平台相关说明请查看 [FaaS字段捷径开发指南](./docs/FaaS字段捷径开发指南.md)
+
+## 本地开发
+
+```bash
+# 安装依赖
+npm install
+
+# 启动开发服务
+npm run start
+
+# 测试执行函数
+npm run dev
+```
+
+## 发布
+
+```bash
+# 打包插件
+npm run pack
+```
+
+生成的 `output/output.zip` 文件可上传到飞书多维表格捷径平台。
+
+## 环境要求
+
+- Node.js 14.21.0（与线上环境一致）
+- 运行超时：15 分钟
+
+## 技术说明
+
+- 微信文章解析：cheerio + turndown
+- 普通网页解析：Jina Reader API
+- 图片代理：images.weserv.nl（解决微信防盗链）
+
+## 限制说明
+
+- 单表单字段每分钟最多处理 90 条记录
+- 不支持访问公司内网地址
+- 微信文章需要能公开访问
+
+## 联系方式
+
+如有问题请联系 Gary
+
+## 许可证
+
+ISC

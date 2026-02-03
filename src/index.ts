@@ -1,191 +1,450 @@
-import { basekit, FieldType, field, FieldComponent, FieldCode, NumberFormatter, AuthorizationType } from '@lark-opdev/block-basekit-server-api';
+import { basekit, FieldType, field, FieldComponent, FieldCode } from '@lark-opdev/block-basekit-server-api';
+import * as cheerio from 'cheerio';
+import TurndownService from 'turndown';
+
 const { t } = field;
 
-const feishuDm = ['feishu.cn', 'feishucdn.com', 'larksuitecdn.com', 'larksuite.com'];
-// 通过addDomainList添加请求接口的域名，不可写多个addDomainList，否则会被覆盖
-basekit.addDomainList([...feishuDm, 'api.exchangerate-api.com',]);
+// ============ 域名白名单配置 ============
+// 必须配置，否则请求会被拒绝
+const domainList = [
+  'mp.weixin.qq.com',   // 微信公众号文章
+  'mmbiz.qpic.cn',      // 微信图片 CDN
+  'r.jina.ai',          // Jina Reader API
+  'images.weserv.nl',   // 图片代理服务（解决微信防盗链）
+];
+
+basekit.addDomainList(domainList);
+
+// ============ 常量配置 ============
+const JINA_RATE_LIMIT_STATUS = 429;
+const MAX_RETRY_COUNT = 3;
+const RETRY_DELAY_MS = 2000;
+
+// ============ 类型定义 ============
+interface ExecuteContext {
+  fetch: (url: string, options?: RequestInit) => Promise<Response>;
+  logID: string;
+  baseID: string;
+  tableID: string;
+  packID: string;
+  tenantKey: string;
+  timeZone: string;
+}
+
+function isWeChatUrl(url: string): boolean {
+  try {
+    const urlObj = new URL(url);
+    return urlObj.hostname === 'mp.weixin.qq.com';
+  } catch {
+    return false;
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+export function normalizeError(error: unknown): { name: string; message: string; stack?: string } {
+  if (error instanceof Error) {
+    return {
+      name: error.name || 'Error',
+      message: error.message || String(error),
+      stack: error.stack,
+    };
+  }
+
+  if (typeof error === 'string') {
+    return {
+      name: 'Error',
+      message: error,
+    };
+  }
+
+  try {
+    return {
+      name: 'Error',
+      message: JSON.stringify(error),
+    };
+  } catch {
+    return {
+      name: 'Error',
+      message: String(error),
+    };
+  }
+}
+
+async function parseWeChatArticle(
+  url: string, 
+  context: ExecuteContext
+): Promise<{ title: string; content: string }> {
+  const { fetch, logID } = context;
+  
+  console.log(logID, '[WeChat] 开始获取文章:', url);
+  
+  const response = await fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    },
+  });
+
+  if (!response.ok) {
+    console.log(logID, '[WeChat] 请求失败:', response.status);
+    throw new Error(`获取微信文章失败: HTTP ${response.status}`);
+  }
+
+  const html = await response.text();
+  const $ = cheerio.load(html);
+
+  const title = $('#activity-name').text().trim() || $('title').text().trim() || '无标题';
+
+  $('script, style, noscript, iframe, .qr_code_pc, .rich_media_area_extra, #js_pc_qr_code, #js_profile_qrcode').remove();
+
+  const $content = $('#js_content');
+  if ($content.length === 0) {
+    throw new Error('未找到微信文章内容区域 (#js_content)');
+  }
+
+  $content.find('img').each((_, img) => {
+    const $img = $(img);
+    const dataSrc = $img.attr('data-src');
+    if (dataSrc && !$img.attr('src')) {
+      $img.attr('src', dataSrc);
+    }
+  });
+
+  $content.find('section[data-role="paragraph"]').each((_, section) => {
+    const $section = $(section);
+    if ($section.children().length === 0 && $section.text().trim() === '') {
+      $section.remove();
+    }
+  });
+
+  const turndownService = new TurndownService({
+    headingStyle: 'atx',
+    codeBlockStyle: 'fenced',
+    bulletListMarker: '-',
+    strongDelimiter: '**',
+    emDelimiter: '*',
+  });
+
+  turndownService.addRule('preserveImages', {
+    filter: 'img',
+    replacement: (content, node: any) => {
+      let src = node.getAttribute?.('src') || node.getAttribute?.('data-src') || '';
+      const alt = node.getAttribute?.('alt') || '';
+      if (!src) return '';
+      
+      // 使用图片代理服务解决微信防盗链问题
+      // images.weserv.nl 是免费的图片代理服务
+      if (src.includes('mmbiz.qpic.cn') || src.includes('mmbiz.qlogo.cn')) {
+        // 对 URL 进行编码，确保特殊字符被正确处理
+        src = `https://images.weserv.nl/?url=${encodeURIComponent(src)}`;
+      }
+      
+      return `![${alt}](${src})`;
+    },
+  });
+
+  turndownService.addRule('removeEmptyParagraphs', {
+    filter: (node) => {
+      return node.nodeName === 'P' && node.textContent?.trim() === '' && !node.querySelector('img');
+    },
+    replacement: () => '',
+  });
+
+  const contentHtml = $content.html() || '';
+  let markdown = turndownService.turndown(contentHtml);
+
+  markdown = markdown
+    .replace(/\n{3,}/g, '\n\n')
+    .replace(/^\s+|\s+$/g, '');
+
+  console.log(logID, '[WeChat] 解析完成, 标题:', title.substring(0, 30));
+  
+  return { title, content: markdown };
+}
+
+async function fetchWithJina(
+  url: string, 
+  apiKey: string | undefined, 
+  context: ExecuteContext
+): Promise<{ title: string; content: string }> {
+  const { fetch, logID } = context;
+  const jinaUrl = 'https://r.jina.ai/';
+  
+  const headers: Record<string, string> = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+  };
+
+  if (apiKey && apiKey.trim()) {
+    headers['Authorization'] = `Bearer ${apiKey.trim()}`;
+    console.log(logID, '[Jina] 使用 API Key 认证');
+  } else {
+    console.log(logID, '[Jina] 未提供 API Key，使用免费额度');
+  }
+
+  let lastError: Error | null = null;
+  
+  for (let attempt = 0; attempt < MAX_RETRY_COUNT; attempt++) {
+    console.log(logID, '[Jina] 请求尝试:', attempt + 1, '/', MAX_RETRY_COUNT);
+    
+    try {
+      const response = await fetch(jinaUrl, {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ url }),
+      });
+
+      if (response.status === JINA_RATE_LIMIT_STATUS) {
+        console.log(logID, '[Jina] 遇到限流 (429)，等待重试...');
+        lastError = new Error(`Jina API 请求超限 (429)，第 ${attempt + 1} 次重试...`);
+        if (attempt < MAX_RETRY_COUNT - 1) {
+          await sleep(RETRY_DELAY_MS * (attempt + 1));
+          continue;
+        }
+        throw new Error('Jina API 请求超限，已达最大重试次数。建议配置 API Key 提高限额');
+      }
+
+      if (!response.ok) {
+        console.log(logID, '[Jina] 请求失败:', response.status);
+        throw new Error(`Jina API 请求失败: HTTP ${response.status}`);
+      }
+
+      const result = await response.json() as {
+        code: number;
+        status?: string;
+        data?: { title?: string; content?: string };
+      };
+      
+      if (result.code !== 200 || !result.data) {
+        console.log(logID, '[Jina] API 返回错误:', result.status);
+        throw new Error(`Jina API 返回错误: ${result.status || '未知错误'}`);
+      }
+
+      const title = result.data.title || '无标题';
+      const content = result.data.content || '';
+
+      console.log(logID, '[Jina] 解析成功, 标题:', title.substring(0, 30));
+      
+      return { title, content };
+    } catch (error: any) {
+      if (error.message?.includes('请求超限') && attempt < MAX_RETRY_COUNT - 1) {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  throw lastError || new Error('Jina API 请求失败');
+}
 
 basekit.addField({
-  // 定义捷径的i18n语言资源
+  // ============ 国际化配置 ============
+  // 支持 zh-CN、en-US、ja-JP 三种语言
   i18n: {
     messages: {
       'zh-CN': {
-        'rmb': '人民币金额',
-        'usd': '美元金额',
-        'rate': '汇率',
+        'url': '文章链接',
+        'urlPlaceholder': '请输入网页链接（支持微信公众号文章和普通网页）',
+        'urlTooltip': '微信公众号文章将使用专用解析器，其他网页使用 Jina Reader API。',
+        'tutorialLink': '使用教程',
+        'jinaApiKey': 'Jina API Key',
+        'jinaApiKeyPlaceholder': '可选，填写后可提高请求限额',
+        'jinaApiKeyTooltip': '免费获取: https://jina.ai/?sui=apikey',
       },
       'en-US': {
-        'rmb': 'RMB Amount',
-        'usd': 'Dollar amount',
-        'rate': 'Exchange Rate',
+        'url': 'Article URL',
+        'urlPlaceholder': 'Enter webpage URL (supports WeChat articles and regular webpages)',
+        'urlTooltip': 'WeChat articles use dedicated parser, other webpages use Jina Reader API.',
+        'tutorialLink': 'Tutorial',
+        'jinaApiKey': 'Jina API Key',
+        'jinaApiKeyPlaceholder': 'Optional, increases request quota',
+        'jinaApiKeyTooltip': 'Get free key: https://jina.ai/?sui=apikey',
       },
       'ja-JP': {
-        'rmb': '人民元の金額',
-        'usd': 'ドル金額',
-        'rate': '為替レート',
+        'url': '記事リンク',
+        'urlPlaceholder': 'ウェブページのURLを入力（WeChat記事と一般的なウェブページに対応）',
+        'urlTooltip': 'WeChat記事は専用パーサーを使用、その他はJina Reader APIを使用。',
+        'tutorialLink': 'チュートリアル',
+        'jinaApiKey': 'Jina API Key',
+        'jinaApiKeyPlaceholder': 'オプション、入力するとリクエスト制限が増加',
+        'jinaApiKeyTooltip': '無料で取得: https://jina.ai/?sui=apikey',
       },
     }
   },
-  // 定义捷径的入参
+
   formItems: [
     {
-      key: 'account',
-      label: t('rmb'),
+      key: 'url',
+      label: t('url'),
       component: FieldComponent.FieldSelect,
       props: {
-        supportType: [FieldType.Number],
+        placeholder: t('urlPlaceholder'),
+        // 支持文本字段和超链接字段
+        // 注意：FieldSelect 只支持 文本、单选、多选、日期、附件、数字、复选框、超链接
+        supportType: [FieldType.Text, FieldType.Url],
       },
+      tooltips: [
+        {
+          type: 'text',
+          content: t('urlTooltip'),
+        },
+        {
+          type: 'link',
+          text: t('tutorialLink'),
+          link: 'https://foodtalks.feishu.cn/docx/CjhZdWkRJoYUawxxbfxc1vbOnAg',
+        },
+      ],
       validator: {
         required: true,
-      }
-    },
-  ],
-  // 定义捷径的返回结果类型
-  resultType: {
-    type: FieldType.Object,
-    extra: {
-      icon: {
-        light: 'https://lf3-static.bytednsdoc.com/obj/eden-cn/eqgeh7upeubqnulog/chatbot.svg',
       },
-      properties: [
+    },
+    {
+      key: 'jinaApiKey',
+      label: t('jinaApiKey'),
+      component: FieldComponent.Input,
+      props: {
+        placeholder: t('jinaApiKeyPlaceholder'),
+      },
+      tooltips: [
         {
-          key: 'id',
-          isGroupByKey: true,
-          type: FieldType.Text,
-          label: 'id',
-          hidden: true,
-        },
-        {
-          key: 'usd',
-          type: FieldType.Number,
-          label: t('usd'),
-          primary: true,
-          extra: {
-            formatter: NumberFormatter.DIGITAL_ROUNDED_2,
-          }
-        },
-        {
-          key: 'rate',
-          type: FieldType.Number,
-          label: t('rate'),
-          extra: {
-            formatter: NumberFormatter.DIGITAL_ROUNDED_4,
-          }
+          type: 'text',
+          content: t('jinaApiKeyTooltip'),
         },
       ],
     },
+  ],
+
+  resultType: {
+    type: FieldType.Text,
   },
-  // formItemParams 为运行时传入的字段参数，对应字段配置里的 formItems （如引用的依赖字段）
-  execute: async (formItemParams: { account: number }, context) => {
-    const { account = 0 } = formItemParams;
-    /** 
-         * 为方便查看日志，使用此方法替代console.log
-         * 开发者可以直接使用这个工具函数进行日志记录
-         */
-    function debugLog(arg: any, showContext = false) {
-      // @ts-ignore
-      if (!showContext) {
-        console.log(JSON.stringify({ arg, logID: context.logID }), '\n');
-        return;
-      }
-      console.log(JSON.stringify({
-        formItemParams,
-        context,
-        arg
-      }), '\n');
-    }
 
-    // 入口第一行日志，展示formItemParams和context，方便调试
-    // 每次修改版本时，都需要修改日志版本号，方便定位问题
-    debugLog('=====start=====v1', true);
-
-    /** 
-     * 封装好的fetch函数 - 开发者请尽量使用这个封装，而不是直接调用context.fetch
-     * 这个封装会自动处理日志记录和错误捕获，简化开发工作
-     */
-    const fetch: <T = Object>(...arg: Parameters<typeof context.fetch>) => Promise<T | { code: number, error: any, [p: string]: any }> = async (url, init, authId) => {
-      try {
-        const res = await context.fetch(url, init, authId);
-        // 不要直接.json()，因为接口返回的可能不是json格式，会导致解析错误
-        const resText = await res.text();
-
-        // 自动记录请求结果日志
-        debugLog({
-          [`===fetch res： ${url} 接口返回结果`]: {
-            url,
-            init,
-            authId,
-            resText: resText.slice(0, 4000), // 截取部分日志避免日志量过大
-          }
-        });
-
-        return JSON.parse(resText);
-      } catch (e) {
-        // 自动记录错误日志
-        debugLog({
-          [`===fetch error： ${url} 接口返回错误`]: {
-            url,
-            init,
-            authId,
-            error: e
-          }
-        });
-        return {
-          code: -1,
-          error: e
-        };
-      }
-    };
+  // ============ 执行函数 ============
+  execute: async (
+    formItemParams: {
+      url: unknown;  // 支持多种字段类型，使用 unknown
+      jinaApiKey?: string;
+    }, 
+    context: ExecuteContext
+  ) => {
+    const { logID } = context;
+    
+    console.log(logID, '========== URL to Markdown 开始执行 ==========');
 
     try {
-
-      interface ExchangeRateResponse {
-        rates: {
-          [currency: string]: number
+      const { url: urlField, jinaApiKey } = formItemParams;
+      
+      console.log(logID, '[Debug] 原始输入:', JSON.stringify(urlField));
+      
+      // 解析输入字段（支持多种字段类型）
+      // - 文本字段: [{ type: 'text', text: '内容' }]
+      // - URL 字段: { link: 'url', text: '显示文本' } 或 [{ link: 'url', text: '显示文本' }]
+      // - 公式字段: 可能返回字符串或数组
+      let url: string = '';
+      
+      if (typeof urlField === 'string') {
+        // 直接是字符串
+        url = urlField.trim();
+      } else if (Array.isArray(urlField) && urlField.length > 0) {
+        // 数组格式（文本字段或 URL 字段数组）
+        const firstItem = urlField[0] as Record<string, unknown>;
+        if (firstItem) {
+          // 尝试从 link 字段获取（URL 字段格式）
+          if (typeof firstItem.link === 'string') {
+            url = firstItem.link.trim();
+          }
+          // 尝试从 text 字段获取（文本字段格式）
+          else if (typeof firstItem.text === 'string') {
+            url = firstItem.text.trim();
+          }
+          // 尝试数组中的第二个元素（有些格式第一个是类型标识）
+          else if (urlField.length > 1) {
+            const secondItem = urlField[1] as Record<string, unknown>;
+            if (typeof secondItem?.text === 'string') {
+              url = secondItem.text.trim();
+            } else if (typeof secondItem?.link === 'string') {
+              url = secondItem.link.trim();
+            }
+          }
+        }
+      } else if (urlField && typeof urlField === 'object') {
+        // 对象格式（URL 字段）
+        const urlObj = urlField as Record<string, unknown>;
+        if (typeof urlObj.link === 'string') {
+          url = urlObj.link.trim();
+        } else if (typeof urlObj.text === 'string') {
+          url = urlObj.text.trim();
         }
       }
+      
+      console.log(logID, '[Debug] 解析后的 URL:', url);
 
-      const res = await fetch<ExchangeRateResponse>('https://api.exchangerate-api.com/v4/latest/CNY2', { // 已经在addDomainList中添加为白名单的请求
-        method: 'GET',
-      });
+      // 验证输入
+      if (!url) {
+        console.log(logID, '[Error] 输入为空');
+        return {
+          code: FieldCode.ConfigError,
+          msg: 'URL 为空',
+          data: '请输入有效的网页链接',
+        };
+      }
 
-      const usdRate = res?.rates?.['USD'];
+      // 验证 URL 格式
+      try {
+        new URL(url);
+      } catch {
+        console.log(logID, '[Error] URL 格式无效:', url);
+        return {
+          code: FieldCode.InvalidArgument,
+          msg: 'URL 格式无效',
+          data: '链接格式无效，请输入完整的 URL（包含 http:// 或 https://）',
+        };
+      }
 
+      const isWeChat = isWeChatUrl(url);
+      console.log(logID, '[Info] 处理 URL:', url.substring(0, 50), '| 类型:', isWeChat ? '微信' : '普通网页');
+
+      let result: { title: string; content: string };
+
+      if (isWeChat) {
+        result = await parseWeChatArticle(url, context);
+      } else {
+        result = await fetchWithJina(url, jinaApiKey, context);
+      }
+
+      const markdown = `# ${result.title}\n\n${result.content}`;
+
+      console.log(logID, '[Success] 转换完成, 标题长度:', result.title.length, '内容长度:', result.content.length);
 
       return {
         code: FieldCode.Success,
-        data: {
-          id: `${Math.random()}`,
-          usd: parseFloat((account * usdRate).toFixed(4)),
-          rate: usdRate,
-        }
+        data: markdown,
+      };
+    } catch (error: unknown) {
+      const normalizedError = normalizeError(error);
+      console.log(logID, '[Error] 执行失败:', normalizedError.message);
+      
+      // 根据错误类型返回对应的错误码
+      const errorMsg = normalizedError.message || '未知错误';
+      
+      if (errorMsg.includes('请求超限') || errorMsg.includes('429')) {
+        return {
+          code: FieldCode.RateLimit,
+          msg: errorMsg,
+          data: `转换失败: ${errorMsg}`,
+        };
       }
-
-      /*
-        如果错误原因明确，想要向使用者传递信息，要避免直接报错，可将错误信息当作成功结果返回：
-
-      return {
-        code: FieldCode.Success,
-        data: {
-          id: `具体错误原因`,
-          usd: 0,
-          rate: 0,
-        }
-      }
-
-      */
-    } catch (e) {
-      console.log('====error', String(e));
-      debugLog({
-        '===999 异常错误': String(e)
-      });
-      /** 返回非 Success 的错误码，将会在单元格上显示报错，请勿返回msg、message之类的字段，它们并不会起作用。
-       * 对于未知错误，请直接返回 FieldCode.Error，然后通过查日志来排查错误原因。
-       */
+      
       return {
         code: FieldCode.Error,
-      }
+        msg: errorMsg,
+        data: `转换失败: ${errorMsg}`,
+      };
     }
   },
 });
+
 export default basekit;
